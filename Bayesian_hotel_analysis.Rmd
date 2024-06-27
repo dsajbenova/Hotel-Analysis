@@ -1,0 +1,433 @@
+---
+title: "Predicting Hotel Booking Cancellations: a Bayesian Analysis"
+output:
+  pdf_document: default
+  html_document: default
+---
+# INTRODUCTION
+
+In the process of making travel plans, customers often place hotel bookings in advance that they subsequently cancel. Those booking cancellations are costly to hotels. In addition to administration costs, the hotel loses revenue if a room is not utilised on any given day - the problem of idle capacity (See generally Robert Phillips, Pricing and Revenue Optimization, 2nd ed. 2021, Chapter 11). 
+
+If the hotel is able to predict which booking is ultimately cancelled, it can implement an overbooking policy that minimizes expected idle capacity on any given day. The prediction of a booking cancellation using certain circumstance of the booking, is the focus of this report (the *prediction problem*). 
+
+The predicted variable, whether the booking is cancelled, is a binary categorical variable. 
+Therefore, we approach this problem by building a Bayesian logistic regression model, using the data made available by Nuno Antonio, Ana de Almeida and Luis Nunes (Data inBrief22(2019)41–49).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(bayesrules)
+library(rstanarm)
+library(dplyr)
+library(ggplot2)
+library(caret)
+```
+The data is retrieved from the *bayesrules* package using the command below. 
+```{r}
+data(hotel_bookings)
+```
+
+For the purposes of building our model, we focus on the predicted variable and four predictors:\
+- **is canceled**: the response variable, indicating whether or not the booking was canceled,\
+- **lead time**: a predictor variable indicating the number of days between the booking and scheduled arrival, \
+- **previous cancellations**: a predictor variable indicating the number of previous times the customer has canceled a booking, \
+- **is repeated guest**: a predictor variable indicating whether or not the customer is a repeat guest at the hotel, \
+- **average daily rate**: a predictor variable indicating the average daily rate of a room at the hotel.
+
+We subset the dataset to obtain the variables mentioned above. 
+
+```{r}
+df = hotel_bookings %>% select(is_canceled, lead_time, is_repeated_guest, previous_cancellations, average_daily_rate, )
+```
+
+# DATA EXPLORATION
+
+```{r}
+str(df)
+```
+
+As a first step in the data exploration phase, we count the number of observations and tabulate the predicted variable. 
+
+```{r}
+nrow(df)
+table(df$is_canceled)
+```
+We note that there are 1000 bookings in the dataset and that in 366 cases, the booking was cancelled.
+The second step is to assess whether there are any missing values in the dataset.
+
+```{r}
+sum(is.na(df)) # no missing values
+```
+There are no missing values in the dataset. The next step is to summarize the non-binary predictor variables.
+
+```{r}
+summary(df$lead_time)
+summary(df$previous_cancellations)
+summary(df$average_daily_rate)
+```
+The *previous cancellations* summary seems to suggest that the distribution is somewhat skewed, so we tabulate this variable to scrutinize it more closely. 
+
+```{r}
+table(df$previous_cancellations)
+
+```
+
+As suspected from the summary statistics, it turns out that the vast majority of customers have not previously cancelled a booking (94.9%), a small minority has cancelled once (4.8%) 
+and two guests have cancelled more than 20 times. 
+
+As there are only three customers having cancelled more than once, it may be worthwhile to convert the *previous_cancellations* variable into a binary predictor with 0 = no previous cancellations and 1 = previous cancellations.  
+
+```{r}
+df = df %>%
+  mutate(previous_cancellations = case_when(
+    previous_cancellations == 0 ~ 0,
+    previous_cancellations >= 1 ~ 1
+  ))
+
+df$previous_cancellations = as.factor(df$previous_cancellations)
+class(df$previous_cancellations)
+
+table(df$previous_cancellations)
+```
+
+Thus, there are 949 customers who have not previously cancelled (94.9%) and 51 (5.1%) who have. We can visualize this in a bar chart. 
+
+```{r}
+counts = data.frame(category = c("no", "yes"), counts = c(949, 51))
+
+ggplot(counts, aes(x = category, y = counts, fill = category)) + geom_bar(stat = "identity") + theme(legend.position = "none") + ggtitle("Bar Chart of Previous Cancellations")
+```
+
+The next step is to tabulate the binary predictor *is_repeated_guest* and plot the values in a bar chart.
+
+```{r}
+table(df$is_repeated_guest)
+
+counts = data.frame(category = c("no", "yes"), counts = c(968, 31))
+
+ggplot(counts, aes(x = category, y = counts, fill = category)) + geom_bar(stat = "identity") + theme(legend.position = "none") + ggtitle("Bar Chart of Is Repeated Guest")
+```
+
+It turns out that most of the customers are not repeat guests (96.8%). Only in a tiny minority of the bookings, had the customer visited the hotel before (3.1%). 
+
+We plot histograms of the continous predictors for visual inspection.
+
+```{r}
+hist(df$lead_time, col = "coral1", breaks = 20)
+hist(df$average_daily_rate, col = "darkgoldenrod1", breaks = 20)
+```
+
+To have a better sense of whether cancellations are likely to occur at particular values of the 
+variable *lead time*, a box plot is created. 
+
+```{r}
+ggplot(df, aes(x = is_canceled, y = lead_time, fill = is_canceled)) + geom_boxplot() + theme(legend.position = "none") 
+```
+Visual inspection leads to the conclusion that for the cancelled bookings, the average lead time is longer than for bookings that are not cancelled. A box plot is also created mapping average daily rates to cancellations.
+
+```{r}
+ggplot(df, aes(x = is_canceled, y = average_daily_rate, fill = is_canceled)) + geom_boxplot() + theme(legend.position = "none") 
+```
+The medians and the variation of the average daily rates do not seem to differ much between the 
+cancelled and the consummated bookings.
+
+# DATA PREPARATION
+
+As the purpose of the analysis is to construct and test a model that predicts cancellations, it is necessary to divide the dataset in a training and a test set. 
+
+The model will be tuned with the training set, and its performance will be evaluated with the test set. We have opted for a 75-25 split between train and test observations.  
+
+We will also center and scale the continuous variables in the training dataset and do the same for the test set. From now on, we will use the scaled datasets for model building and prediction. 
+
+```{r}
+set.seed(123456)
+index = sample(1:nrow(df), 750)
+
+train.data = df[index, ]
+test.data = df[-index, ]
+```
+
+```{r}
+train.data.scaled = train.data
+test.data.scaled = test.data
+
+set.seed(123456)
+preprocessing = preProcess(train.data[ , c(-1, -3, -4)], method = c("center", "scale"))
+
+train.data.scaled[ , c(-1, -3, -4)] = predict(preprocessing, train.data[ , c(-1, -3, -4)])
+test.data.scaled[ , c(-1, -3, -4)] = predict(preprocessing, test.data[ , c(-1, -3, -4)])
+```
+
+
+# MODEL CONSTRUCTION
+
+Following the approach set out in Alicia Johnson, Miles Ott, Mine Dogucu, **Bayes Rules! An Introduction to Applied Bayesian Modeling**, 1st ed. 2022, the construction of the model proceeds in three steps: \
+- 1. specifying the data model. \
+- 2. specifying the priors. \
+- 3. simulating the posterior. \
+
+**Data Model**
+
+As the predicted variable ($Y$) is a binary discrete variable, a Bernoulli probability model is best suited for the task.
+We assume that whether a particular booking $i$ is cancelled ($Y_i$), depends on the four predictor variables.
+Furthermore, we assume that the probability of cancellation is $\pi$. We can link the probability of cancellation
+to the predictors using a linear model:
+$g(\pi_i) = \beta_0 + \beta_1 x_1 + \beta_2 x_2 + \beta_3 x_3 + \beta_4 x_4$
+with \
+- $\beta_0$ is the log odds of cancellation, and the intercept of the regression. \
+- $\beta_1$ is the change in log odds of cancellation associated with a unit increase in lead time. \
+- $\beta_2$ is the change in log odds of cancellation if the customer is a repeat guest. \
+- $\beta_3$ is the change in log odds of cancellation if the customer previously cancelled. \
+- $\beta_4$ is the change in log odds of cancellation associated with a unit increase in average daily rate.
+
+The probability of a cancellation $\pi$ thus depends on the predictors as follows:
+$\pi = \frac{e^{\beta_0 + \beta_1 x_1 + \beta_2 x_2 + \beta_3 x_3 + \beta_4 x_4}}{1 + e^{\beta_0 + \beta_1 x_1 + \beta_2 x_2 + \beta_3 x_3 + \beta_4 x_4}}$
+
+**Specifying the Priors**
+
+The next step is to specify the priors. We assume that the priors are independent.
+
+For $\beta_0$, it is sensible to set the mean at 37.4% ($\pi = 0.374$), which is the proportion
+of cancellations in the dataset. This probability implies a log odds of -0.515.
+$log \frac{(0.374)}{(1-0.374)} = -0.515$. Based on our limited knowledge and intuition, we posit that
+the chance of cancellation could range anywhere between 20% and 60%, which translates
+to $log \frac{(0.2)}{(1-0.2)} = -1.4$ and $log \frac{(0.6)}{(1-0.6)} = 0.4$.
+On this basis, we use $N(-0.515,0.5)$ for $\beta_0$. 
+As to the priors for $\beta_1$, $\beta_2$ $\beta_3$, and $\beta_4$ we use weakly informative default priors centered at zero tuned by *stan_glm* which reflects the lack of information and certainty as to the impact of the predictor variables on the cancellation of a booking.  
+ 
+```{r}
+fit_MCMC = stan_glm(formula = is_canceled ~ lead_time + is_repeated_guest + previous_cancellations + average_daily_rate,
+                   data = train.data.scaled,
+                   family = binomial(link = "logit"),
+                   algorithm = "sampling",
+                   prior_intercept = normal(-0.515, 0.5, autoscale = TRUE),
+                   #prior = normal(0, 5),
+                   iter = 5000,
+                   #QR = TRUE,
+                   #init_r = 0.1,
+                   adapt_delta = 0.999,
+                   seed = 123456) 
+```
+
+The stan_glm function accounts for burn-in by removing samples  at the beginning of the MCMC chain. Thinning MCMC samples was not implemented as storage was not an issue. 
+
+We attempted to use cross-validation to tune the hyperparameters of the priors. In order to tune the hyperparameters, in particular the intercept $\sigma^{2}$, we applied the kfold function of the *rstanarm* model as described here [https://mc-stan.org/rstanarm/reference/kfold.stanreg.html],
+using the scaled training data set. 
+  
+```{r}
+#kfold1 <- kfold(fit_MCMC, K = 10)
+```
+
+Unfortunately, we were unable to assess whether the cross-validation succeeded and provided the best hyperparameters - inspection of the model after omitting
+respectively including the cross-validation, did not show any differences. Thus, we let the stan_glm function set the hyperparameter values using its default settings. 
+
+```{r}
+fit_MCMC
+
+```
+
+```{r}
+summary(fit_MCMC)
+
+```
+
+The posterior median relationship between the predicted and predictor variables is estimated to be the following:
+
+$\pi = \frac{e^{-0.7 + 0.5 x_1 -1.1 x_2 + 4.0 x_3 + 0.3 x_4}}{1 + e^{-0.7 + 0.5 x_1 + -1.1 x_2 -4.0 x_3 + 0.3 x_4}}$
+
+```{r}
+posterior_interval(fit_MCMC, prob = 0.9) # posterior summary - log(odds) scale
+```
+
+We can interpret these credibility intervals as follows. \
+- For every percentage point increase in lead time, there is a 90% posterior chance that the increase of log(odds of cancellation) lies between 0.383 and 0.672. \
+- In case of repeated guests, there is a 90% posterior chance that the decrease of log(odds of cancellation) lies between -2.345 and -0.027. \
+- In case of previous cancellations, there is a 90% posterior chance that the increase of log(odds of cancellation) lies between 2.778 and 5.732. \
+- For every percentage point increase in average daily rate, there is a 90% posterior chance that the increase of log(odds of cancellation) lies between 0.199 and 0.473.
+
+
+```{r}
+exp(posterior_interval(fit_MCMC, prob = 0.9)) # posterior summary - odds scale
+```
+
+For ease of interpretation, we also interpret the increases of the *odds*. For example, the table above shows that for every percentage point increase in lead time, the odds of
+cancellation increase between 47% and 96%. Inspecting the odds allows a more straightforward comparison of the relevance of each variable for the prediction of a cancellations.
+
+The table shows that *previous cancellations* is by and large the most relevant predictor in this respect.   
+
+Returning to the prior specification of the predictors, each predictor had a normally-distributed prior with mean 0 and a certain standard deviation. For *lead_time* and *average_daily_rate*, the standard deviations were 2.5 for both predictors, but for *is_repeated_guest* and *previous_cancellations*, the adjusted standard deviations by rstanarm were used (about 13.411 and 11.252, respectively). 
+
+Other prior distributions besides the normal distribution were considered. Ghosh, Li, and Mitra (2018) in their study "On the Use of Cauchy Prior Distributions for Bayesian Logistic Regression" also identified the Cauchy distribution and the Student's t distribution as potential prior distributions for logistic regression. However, due to the lack of previous studies regarding hotel booking cancellation as well as convergence diagnostics which were satisfactory for normally distributed priors, the default normal distributions used by stan_glm for priors were used. 
+
+```{r}
+prior_summary(fit_MCMC)
+```
+
+```{r}
+prior_summary(fit_MCMC)$prior
+```
+
+# POSTERIOR SUMMARIES AND VISUALIZATIONS
+
+Based on the model specification, posterior summaries and visualizations can be obtained. We begin with the posterior credibility intervals for each parameter (intercept and the four predictors). The thicker lines visualize the 50% credibility intervals while the thinner lines visualize the 90% credibility intervals. The dots are the posterior medians for each parameter. 
+
+It is evident from the posterior credibility plot that all parameters except for *is_repeated_guest* and *previous_cancellations* have rather narrow credibility intervals.  
+
+```{r}
+library(bayesplot)
+
+posterior = as.array(fit_MCMC)
+dimnames(posterior)
+
+# posterior intervals
+color_scheme_set("orange")
+mcmc_intervals(posterior) 
+```
+
+
+Next, we can visualize the marginal posterior distributions for each parameter, either by each chain individually (with four chains in total) or by merging the chains together. The first plot are histograms of the marginal posterior distributions for each parameter, while the second plot are the kernel density estimates. The third plot shows histograms of each chain separately for each parameter. The last plot shows the kernel density estimates of each chain for each parameter.  
+
+Overall, the chains are fairly consistent in their computation of the posterior marginal distributions, which can be visualized by the similar shape of the posterior marginal distributions in the third plot and the overlap of the chains in the last plot.
+
+```{r}
+# plotting marginal posterior distributions - merging all chains
+color_scheme_set("brightblue")
+mcmc_hist(posterior)
+
+# kernel density
+color_scheme_set("pink")
+mcmc_dens(posterior)
+
+# for each chain
+color_scheme_set("purple")
+mcmc_hist_by_chain(posterior)
+
+# density overlaying Markov chains
+mcmc_dens_overlay(posterior)
+```
+
+# CONVERGENCE DIAGNOSTICS
+
+Convergence diagnostics begin here with trace plots for each parameter. The aim is for trace plots to resemble a caterpillar shape and for chains to overlap one another. If these assumptions are not satisfied, there are problems with convergence. 
+
+Trace plots for all parameters appear satisfactory.  
+
+```{r}
+# trace plots
+color_scheme_set("viridis")
+mcmc_trace(posterior, facet_args = list(ncol = 1, strip.position = "left")) + theme(legend.position = "top", legend.direction = "horizontal") 
+
+```
+An additional convergence diagnostic are autocorrelation plots given for each parameter. One hopes to see autocorrelations which rapidly decrease, as a slow decrease indicates issues with MCMC convergence. 
+
+Autocorrelation plots for all parameters show a rapid decline and do not indicate issues with MCMC convergence.
+
+```{r}
+mcmc_acf_bar(posterior)
+```
+
+A further diagnostic is effective sample size. Effective sample size, $n_{eff}$, indicates how many independent samples the dependent samples correspond to. A plot of the ratio of effective sample size over the total number of MCMC samples can be created for each parameter, with three regions: ratio smaller than 0.1, ratio smaller than 0.5 but larger than 0.1, and ratio larger than 0.5. If the ratio is less than 0.1 (or equivalently, the effective sample is 10% of the total MCMC samples), then this indicates issues with convergence. The aim is to have a larger ratio. 
+
+Ratios for all parameters were not lower than 0.1 and all values were above 0.5, once again indicating successful convergence. 
+
+```{r}
+ratios = neff_ratio(fit_MCMC)
+ratios
+
+mcmc_neff(ratios, size = 2) + yaxis_text(hjust = 1)
+```
+
+Another diagnostic is known as the potential scale reduction factor or $\hat{R}$ which is again calculated per parameter. $\hat{R}$ should not be over 1.1 for any parameter, as this indicates issues with convergence. 
+
+$\hat{R}$ values for each parameter were not over 1.1, with all parameters having $\hat{R}$ values very close to 1. This once again indicates sufficient convergence. 
+
+```{r}
+rhats = rhat(fit_MCMC)
+
+rhats
+
+mcmc_rhat(rhat = rhat(fit_MCMC)) + yaxis_text(hjust = 1)
+```
+
+The diagnostics for Hamiltonian MCMC, which is the posterior approximation behind the stan_glm function can also be investigated. A parallel coordinate plot can be created to visualize divergent transitions, which are lines indicated in red. Each line is an MCMC run. 
+
+Pairs plots can also be created which plots pairwise each of the five parameters. The diagonal shows the marginal posteriors while the off-diagonals are the pairs plots. Divergent transitions are once again indicated in red, and a banana-shaped pairs plot suggests non-identifiability. 
+
+Divergent transitions are not evident as red lines are absent. Banana-shaped pairs plots are also not present.  
+
+```{r}
+# divergent transitions
+color_scheme_set("darkgray")
+np = nuts_params(fit_MCMC)
+
+mcmc_parcoord(fit_MCMC, np = np)
+
+mcmc_pairs(fit_MCMC, np = np, off_diag_args = list(size = 0.75))
+```
+
+Thus, it can be concluded that on the basis of the above convergence diagnostics, there do not appear to be issues with convergence of Markov chains. 
+
+# PREDICTION
+
+Now we can use our scaled test set to determine how well the specified model predicts unseen observations. The posterior_predict function was used to obtain predictions from the posterior predictive distribution. 
+
+Each customer in the scaled test dataset receives a probability of belonging to class 1, which is the probability of cancelling their booking based on the previously-specified model. However, to determine the accuracy of prediction as well as specificity and sensitivity, a threshold at which customers are classified into class 1 must be set. To begin, the natural choice of a 0.5 threshold is set to classify customers to class 1 if their probability is 0.5 or higher. 
+
+The resulting accuracy is 0.692 while the sensitivity was 0.3516 and specificity was 0.8868. However, we would like to reach a sensitivity of 0.75 and thus need to change our threshold. 
+
+```{r}
+predictions = rstanarm::posterior_predict(fit_MCMC, newdata = test.data.scaled, seed = 123456)
+dim(predictions)
+predict.prob = colMeans(predictions) # probability 
+
+predict.class.5 = as.integer(predict.prob >= 0.5) # prediction class
+
+metrics = confusionMatrix(as.factor(predict.class.5), as.factor(test.data.scaled$is_canceled), positive = "1")
+
+confusionMatrix(as.factor(predict.class.5), as.factor(test.data.scaled$is_canceled), positive = "1")
+```
+
+A threshold of 0.29 leads to a sensitivity of around 0.75 and specificity 0.49. The overall accuracy is 0.584. In other words, customers are classified into class 1 if their predicted probability is 0.29 or higher. 
+
+```{r}
+predict.class = as.integer(predict.prob >= 0.29) # prediction class
+
+metrics = confusionMatrix(as.factor(predict.class), as.factor(test.data.scaled$is_canceled), positive = "1")
+
+confusionMatrix(as.factor(predict.class), as.factor(test.data.scaled$is_canceled), positive = "1")
+```
+
+We can also visualize the ROC curve and calculate the subsequent area under the curve (AUC) to get an idea about how well our classifier predicts unseen observations. The aim is to get to a ROC curve which touches the top left corner and an AUC value of 1. Based on our model, the AUC obtained is about 0.704. 
+
+```{r}
+library(precrec)
+aucs = evalmod(scores = predict.prob, labels = test.data.scaled$is_canceled)
+aucs
+
+autoplot(aucs) 
+```
+
+As our model is a logistic regression model, a calibration plot can be created. Calibration plots are useful to verify the quality of predictions for probabilistic models. The aim is for the dots in the calibration plot to be as close to the perfect calibration curve, which is the dotted reference line. The calibration plot generally shows dots near the reference line, except near the right of the plots where the dots are below the reference line. 
+
+Overall, the classifier has an advantage with regards to sensitivity and a fair AUC value, but further improvements may be required. 
+
+```{r}
+# calibration plot
+
+calibration.plot = calibration(y ~ pred,
+                data = data.frame(pred = predict.prob, y = as.factor(test.data.scaled$is_canceled)),
+                                  cuts = 10,
+                                  class = "1")
+
+ggplot(calibration.plot, auto.key = list(columns = 1))
+```
+
+# References
+
+Ghosh, J., Li, Y., & Mitra, R. (2018). On the use of Cauchy prior distributions for Bayesian logistic regression. Bayesian Analysis, 13(2), 359-383.
+
+Johnson, A. A., Ott, M. Q., & Dogucu, M. (2022). Bayes Rules!: An Introduction to Applied Bayesian Modeling. CRC Press.
+
+Phillips, R. L. (2021). Pricing and revenue optimization. In Pricing and Revenue Optimization. Stanford university press.
